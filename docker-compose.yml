@@ -1,0 +1,164 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: predidbos-postgres
+    environment:
+      POSTGRES_DB: predidbos
+      POSTGRES_USER: predidbos
+      POSTGRES_PASSWORD: predidbos
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./database/postgresql.conf:/etc/postgresql/postgresql.conf
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U predidbos -d predidbos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: predidbos-backend
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: predidbos
+      POSTGRES_USER: predidbos
+      POSTGRES_PASSWORD: predidbos
+      ML_SERVICE_URL: http://ml:8000
+      OS_SERVICE_URL: http://os-service:8001
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ml:
+        condition: service_started
+      os-service:
+        condition: service_started
+    command: npm run dev
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: predidbos-frontend
+    environment:
+      VITE_API_URL: http://localhost:3001
+      VITE_WS_URL: ws://localhost:3001
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    command: npm run dev
+
+  ml:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile
+    container_name: predidbos-ml
+    environment:
+      PYTHONUNBUFFERED: 1
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: predidbos
+      POSTGRES_USER: predidbos
+      POSTGRES_PASSWORD: predidbos
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ml:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  os-service:
+    build:
+      context: ./os_service
+      dockerfile: Dockerfile
+    container_name: predidbos-os-service
+    environment:
+      PYTHONUNBUFFERED: 1
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: predidbos
+      POSTGRES_USER: predidbos
+      POSTGRES_PASSWORD: predidbos
+      BACKEND_URL: http://backend:3001
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./os_service:/app
+      - postgres_data:/var/lib/postgresql/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  collector:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+    container_name: predidbos-collector
+    environment:
+      PYTHONUNBUFFERED: 1
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: predidbos
+      POSTGRES_USER: predidbos
+      POSTGRES_PASSWORD: predidbos
+      COLLECTION_INTERVAL: 5
+      BACKEND_URL: http://backend:3001
+    volumes:
+      - ./collector:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: python collector.py
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: predidbos-orchestrator
+    environment:
+      PYTHONUNBUFFERED: 1
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: predidbos
+      POSTGRES_USER: predidbos
+      POSTGRES_PASSWORD: predidbos
+      ML_SERVICE_URL: http://ml:8000
+      OS_SERVICE_URL: http://os-service:8001
+      BACKEND_URL: http://backend:3001
+      ORCHESTRATOR_INTERVAL: 10
+      ORCHESTRATOR_BATCH_SIZE: 10
+    volumes:
+      - ./orchestrator:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ml:
+        condition: service_started
+      os-service:
+        condition: service_started
+    command: python orchestrator.py
+
+volumes:
+  postgres_data:
