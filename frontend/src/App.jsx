@@ -207,11 +207,11 @@ function AppContent() {
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-6">
+        <div className="mb-6">
           <SystemMetrics metrics={systemMetrics} />
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <div className="mb-6">
           <PipelineVisualizer 
             state={pipelineState}
             latestEvent={latestEvent}
@@ -230,7 +230,7 @@ function AppContent() {
 
         <LiveCharts performance={performance} systemMetrics={systemMetrics} />
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="mb-6">
           <ErrorBoundary fallback={<div className="card h-full"><div className="card-header"><h3 className="font-semibold text-gray-900 flex items-center gap-2"><Clock className="w-5 h-5 text-gray-500" />Live Event Timeline</h3></div><div className="card-body flex items-center justify-center h-64"><p className="text-gray-500">Event Timeline unavailable</p></div></div>}>
             <EventTimeline />
           </ErrorBoundary>
