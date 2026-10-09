@@ -89,17 +89,7 @@ def extract_object_and_pattern(query: str):
         access_pattern = 'random'
 
     object_name = None
-    from_match = re.search(r'\bfrom\s+(\w+)', query_lower)
-    join_match = re.search(r'\bjoin\s+(\w+)', query_lower)
-    update_match = re.search(r'\bupdate\s+(\w+)', query_lower)
-    insert_match = re.search(r'\binsert\s+into\s+(\w+)', query_lower)
-    delete_match = re.search(r'\bdelete\s+from\s+(\w+)', query_lower)
-
-    for match in [from_match, join_match, update_match, insert_match, delete_match]:
-        if match:
-            object_name = match.group(1)
-            break
-
+    # Determine query type first to prioritize correct table extraction
     query_type = 'SELECT'
     if query_lower.startswith('insert'):
         query_type = 'INSERT'
@@ -109,6 +99,29 @@ def extract_object_and_pattern(query: str):
         query_type = 'DELETE'
     elif query_lower.startswith('create') or query_lower.startswith('alter') or query_lower.startswith('drop'):
         query_type = 'DDL'
+
+    # For DML statements, prioritize the target table over source tables
+    if query_type == 'INSERT':
+        insert_match = re.search(r'\binsert\s+into\s+(\w+)', query_lower)
+        if insert_match:
+            object_name = insert_match.group(1)
+    elif query_type == 'UPDATE':
+        update_match = re.search(r'\bupdate\s+(\w+)', query_lower)
+        if update_match:
+            object_name = update_match.group(1)
+    elif query_type == 'DELETE':
+        delete_match = re.search(r'\bdelete\s+from\s+(\w+)', query_lower)
+        if delete_match:
+            object_name = delete_match.group(1)
+
+    # For SELECT and other queries, or if DML target not found, fall back to FROM/JOIN
+    if object_name is None:
+        from_match = re.search(r'\bfrom\s+(\w+)', query_lower)
+        join_match = re.search(r'\bjoin\s+(\w+)', query_lower)
+        for match in [from_match, join_match]:
+            if match:
+                object_name = match.group(1)
+                break
 
     return object_name, access_pattern, query_type
 

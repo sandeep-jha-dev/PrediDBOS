@@ -41,6 +41,9 @@ class PipelineOrchestrator:
     def __init__(self):
         self.last_processed_workload_id: Optional[uuid.UUID] = None
         self.http_client = httpx.AsyncClient(timeout=30.0)
+        self.current_model_version: Optional[str] = None
+        self.model_version_fetched_at: Optional[datetime] = None
+        self.model_version_ttl_seconds = 60
 
     async def emit_event(self, event_type: str, payload: Dict):
         """Emit an event to the backend event stream."""
@@ -79,7 +82,31 @@ class PipelineOrchestrator:
             conn.close()
 
     async def get_recent_objects(self, limit: int = 4) -> List[str]:
-        """Get recent object names from workload history for ML prediction context."""
+        """Get recent USER object names from workload history for ML prediction context.
+
+        Internal/system objects (PrediDBOS instrumentation, PostgreSQL catalogs) are excluded
+        to match the training formulation which learns user->user transitions.
+        """
+        # We need to fetch more than `limit` because some will be filtered out
+        fetch_limit = limit * 5  # heuristic: fetch 5x to account for internal objects
+
+        INTERNAL_OBJECTS = {
+            'performance_results', 'predictions', 'decisions', 'os_state',
+            'model_metadata', 'workload_history', 'generate_series',
+            'pg_class', 'pg_database', 'pg_catalog', 'pg_attribute',
+            'pg_proc', 'pg_type', 'pg_namespace', 'pg_index', 'pg_stat_statements',
+            'information_schema'
+        }
+        PG_SYSTEM_PREFIXES = ('pg_', 'sql_', 'information_schema_')
+
+        def is_internal(obj_name: str) -> bool:
+            if obj_name in INTERNAL_OBJECTS:
+                return True
+            for prefix in PG_SYSTEM_PREFIXES:
+                if obj_name.startswith(prefix):
+                    return True
+            return False
+
         conn = psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
         try:
             with conn.cursor() as cur:
@@ -89,11 +116,43 @@ class PipelineOrchestrator:
                     WHERE object_name IS NOT NULL
                     ORDER BY timestamp DESC
                     LIMIT %s
-                """, (limit,))
+                """, (fetch_limit,))
                 rows = cur.fetchall()
-                return [row['object_name'] for row in rows]
+
+            # Filter out internal objects
+            user_objects = [row['object_name'] for row in rows if not is_internal(row['object_name'])]
+
+            # Return up to `limit` user objects
+            return user_objects[:limit]
         finally:
             conn.close()
+
+    async def get_model_version(self) -> Optional[str]:
+        """Fetch the active model version from ML service."""
+        now = datetime.utcnow()
+        if (self.current_model_version and self.model_version_fetched_at and
+            (now - self.model_version_fetched_at).total_seconds() < self.model_version_ttl_seconds):
+            return self.current_model_version
+
+        try:
+            response = await self.http_client.get(f"{ML_SERVICE_URL}/model/status")
+            if response.status_code == 200:
+                data = response.json()
+                # ML service now returns nested structure: base_model.model_version
+                model_version = data.get('base_model', {}).get('model_version')
+                # Fallback for legacy flat structure
+                if not model_version:
+                    model_version = data.get('model_version')
+                if model_version:
+                    self.current_model_version = model_version
+                    self.model_version_fetched_at = now
+                    logger.info(f"Fetched model version: {model_version}")
+                    return model_version
+            else:
+                logger.warning(f"Failed to fetch model version: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Error fetching model version: {e}")
+        return self.current_model_version
 
     async def call_ml_prediction(self, recent_objects: List[str], query_type: str = 'SELECT') -> Optional[Dict]:
         """Call ML service to get prediction."""
@@ -223,10 +282,21 @@ class PipelineOrchestrator:
         try:
             # 1. Get recent objects for ML context
             recent_objects = await self.get_recent_objects(4)
-            if not recent_objects:
-                recent_objects = [object_name]
 
-            # 2. Call ML prediction
+            # 2. Check for sufficient history - need at least 4 objects for [current, prev1, prev2, prev3]
+            if len(recent_objects) < 4:
+                logger.debug(f"Insufficient history for workload {workload_id}: "
+                           f"{len(recent_objects)} objects available, need 4. Skipping prediction.")
+                # Emit event for observability
+                await self.emit_event('prediction_skipped', {
+                    'workload_id': str(workload_id),
+                    'reason': 'insufficient_history',
+                    'objects_available': len(recent_objects),
+                    'objects_required': 4,
+                })
+                return False
+
+            # 3. Call ML prediction
             ml_result = await self.call_ml_prediction(recent_objects, query_type)
             if not ml_result:
                 logger.warning(f"ML prediction failed for workload {workload_id}")
@@ -240,10 +310,15 @@ class PipelineOrchestrator:
                 logger.warning(f"No prediction returned for workload {workload_id}")
                 return False
 
-            # 3. Record prediction
+            # 3. Record prediction with actual model version
+            model_version = await self.get_model_version()
+            if not model_version:
+                logger.warning("No model version available, skipping prediction")
+                return False
+
             prediction_id = await self.record_prediction(
                 workload_id, predicted_object, predicted_access_pattern,
-                confidence, 'orchestrator_v1', {}
+                confidence, model_version, {}
             )
 
             # Emit prediction_created event
@@ -253,12 +328,12 @@ class PipelineOrchestrator:
                 'predicted_object': predicted_object,
                 'predicted_access_pattern': predicted_access_pattern,
                 'confidence': confidence,
-                'model_version': 'orchestrator_v1',
+                'model_version': model_version,
             })
 
             # 4. Send hint to OS service /decide
             estimated_size_mb = 10  # Default, could be enhanced
-            
+
             # Emit hint_generated event (the hint is the payload sent to OS service)
             await self.emit_event('hint_generated', {
                 'prediction_id': prediction_id,
